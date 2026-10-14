@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "aws_assistant": {
+      "type": "stdio",
+      "command": "D:/Projects - AI/Aws-Assistant/backend/.venv/Scripts/python.exe",
+      "args": ["-m", "src.vscode_bridge", "--region", "us-east-1", "--stack", "aws-assistant-mcp"],
+      "cwd": "D:/Projects - AI/Aws-Assistant/backend"
+    }
+  }
+}

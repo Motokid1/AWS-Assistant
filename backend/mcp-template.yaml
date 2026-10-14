@@ -1,0 +1,382 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description:
+  "MCP-only AWS Assistant: bearer authenticated tools, async scans and
+  no React/Cognito hosting."
+Parameters:
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '[^@\s]+@[^@\s]+\.[^@\s]+'
+  MonthlyBudget:
+    Type: Number
+    Default: 5
+  BedrockModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+  EnableAnomalyMonitor:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+Conditions:
+  CreateAnomalyMonitor:
+    Fn::Equals:
+      - Ref: EnableAnomalyMonitor
+      - "true"
+Globals:
+  Function:
+    Runtime: python3.12
+    CodeUri: ./
+    Timeout: 29
+    MemorySize: 512
+    Environment:
+      Variables:
+        SCAN_TABLE:
+          Ref: Scans
+        SCAN_ALL_REGIONS: "true"
+        SCAN_MULTI_ACCOUNT: "false"
+        BEDROCK_MODEL_ID:
+          Ref: BedrockModelId
+        ALLOWED_ROLE_ARNS: ""
+        MCP_OAUTH_ENABLED: "false"
+        ENABLE_SCAN_TOOLS: "true"
+Resources:
+  Scans:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: kind
+          AttributeType: S
+        - AttributeName: sort
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: kind-index
+          KeySchema:
+            - AttributeName: kind
+              KeyType: HASH
+            - AttributeName: sort
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+  Token:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+  AuditPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description:
+        Read-only account inspection. Separate role grants storage writes
+        to assistant-owned data only.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Resource: "*"
+            Action:
+              - sts:GetCallerIdentity
+              - ce:GetCostAndUsage
+              - ce:GetCostForecast
+              - ce:GetAnomalies
+              - freetier:GetFreeTierUsage
+              - s3:ListAllMyBuckets
+              - s3:GetAccountPublicAccessBlock
+              - s3:GetBucketPublicAccessBlock
+              - s3:GetBucketPolicyStatus
+              - s3:GetBucketAcl
+              - iam:ListUsers
+              - iam:GetLoginProfile
+              - iam:ListMFADevices
+              - iam:ListAccessKeys
+              - iam:GetAccountSummary
+              - ec2:DescribeRegions
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeVolumes
+              - ec2:DescribeAddresses
+              - ec2:DescribeSnapshots
+              - ec2:DescribeInstances
+              - rds:DescribeDBInstances
+              - cloudwatch:DescribeAlarms
+              - cloudwatch:GetMetricStatistics
+          - Effect: Allow
+            Action: logs:FilterLogEvents
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/*:*
+  Scanner:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.storage.scan_handler
+      Timeout: 900
+      Policies:
+        - Ref: AuditPolicy
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:ConditionCheckItem
+              Resource:
+                - Fn::GetAtt:
+                    - Scans
+                    - Arn
+                - Fn::Sub: ${Scans.Arn}/index/kind-index
+        - Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource:
+                Ref: Notifications
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource:
+                Fn::GetAtt:
+                  - ScannerDLQ
+                  - Arn
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn:
+          Fn::GetAtt:
+            - ScannerDLQ
+            - Arn
+      EventInvokeConfig:
+        MaximumEventAgeInSeconds: 900
+        MaximumRetryAttempts: 0
+      Environment:
+        Variables:
+          REPORT_TOPIC:
+            Ref: Notifications
+      Events:
+        Nightly:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 20 * * ? *)
+            Description: 01:30 India time daily
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 10
+        ThrottlingRateLimit: 5
+  Backend:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.app.mcp_handler
+      Environment:
+        Variables:
+          TOKEN_SECRET:
+            Ref: Token
+          SCAN_FUNCTION:
+            Ref: Scanner
+      Policies:
+        - Ref: AuditPolicy
+        - Ref: InferencePolicy
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource:
+                Fn::GetAtt:
+                  - Scans
+                  - Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                    - cache*
+                    - latest
+                    - scan#*
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource:
+                Fn::GetAtt:
+                  - Scans
+                  - Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys:
+                    - cache*
+                    - scan#*
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource:
+                Ref: Token
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                Fn::GetAtt:
+                  - Scanner
+                  - Arn
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: Api
+            Path: /health
+            Method: GET
+        MCP:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: Api
+            Path: /mcp
+            Method: ANY
+  BackendLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${Backend}
+      RetentionInDays: 7
+  ScannerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${Scanner}
+      RetentionInDays: 7
+  Errors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - Ref: Notifications
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value:
+            Ref: Scanner
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  Notifications:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint:
+            Ref: NotificationEmail
+  ScannerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        - Ref: Notifications
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value:
+            Fn::GetAtt:
+              - ScannerDLQ
+              - QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  InferencePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}
+  Budget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName:
+          Fn::Sub: ${AWS::StackName}-account-budget
+        BudgetLimit:
+          Amount:
+            Ref: MonthlyBudget
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address:
+                Ref: NotificationEmail
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address:
+                Ref: NotificationEmail
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address:
+                Ref: NotificationEmail
+  AnomalyMonitor:
+    Type: AWS::CE::AnomalyMonitor
+    Condition: CreateAnomalyMonitor
+    Properties:
+      MonitorName:
+        Fn::Sub: ${AWS::StackName}-services
+      MonitorType: DIMENSIONAL
+      MonitorDimension: SERVICE
+Outputs:
+  ApiUrl:
+    Value:
+      Fn::Sub: https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+  MCPUrl:
+    Value:
+      Fn::Sub: https://${Api}.execute-api.${AWS::Region}.amazonaws.com/mcp
+  TokenSecretArn:
+    Value:
+      Ref: Token
+  ScannerFunction:
+    Value:
+      Ref: Scanner
+  MCPRoleArn:
+    Value:
+      Fn::GetAtt:
+        - BackendRole
+        - Arn
+  ScannerRoleArn:
+    Value:
+      Fn::GetAtt:
+        - ScannerRole
+        - Arn
+  MCPFunction:
+    Value:
+      Ref: Backend

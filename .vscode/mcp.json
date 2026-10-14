@@ -1,0 +1,15 @@
+{
+  "servers": {
+    "aws_assistant": {
+      "args": [
+        "${workspaceFolder}/backend/src/vscode_bridge.py",
+        "--region",
+        "us-east-1",
+        "--stack",
+        "aws-assistant-mcp"
+      ],
+      "type": "stdio",
+      "command": "${workspaceFolder}/backend/.venv/Scripts/python.exe"
+    }
+  }
+}

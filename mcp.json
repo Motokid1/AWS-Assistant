@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "aws_assistant": {
+      "command": "D:/Projects - AI/Aws-Assistant/backend/.venv/Scripts/python.exe",
+      "args": [
+        "D:/Projects - AI/Aws-Assistant/backend/src/vscode_bridge.py",
+        "--region",
+        "us-east-1",
+        "--stack",
+        "aws-assistant-mcp"
+      ]
+    }
+  }
+}

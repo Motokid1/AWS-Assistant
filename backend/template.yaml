@@ -1,0 +1,409 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Self-hosted read-only AWS Assistant
+Parameters:
+  AllowedOrigin:
+    Type: String
+    Default: http://localhost:5173
+  BudgetEmail:
+    Type: String
+    AllowedPattern: '[^@\s]+@[^@\s]+\.[^@\s]+'
+  MonthlyBudget:
+    Type: Number
+    Default: 5
+  CognitoDomainPrefix:
+    Type: String
+    MinLength: 5
+    Description: Globally unique Cognito hosted login prefix
+  CallbackURL:
+    Type: String
+    Default: http://localhost:5173/
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '[^@\s]+@[^@\s]+\.[^@\s]+'
+  AppName:
+    Type: String
+    Default: AWS Assistant
+  WorkspaceName:
+    Type: String
+    Default: My AWS account
+  BedrockModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+  EnableAnomalyMonitor:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  OAuthCallbackURL:
+    Type: String
+    Default: https://example.invalid/oauth/callback
+  ConnectedRoleArns:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Explicit allowlist of customer read-only role ARNs; leave empty to disable cross-account assumption.
+Conditions:
+  CreateAnomalyMonitor: !Equals [!Ref EnableAnomalyMonitor, 'true']
+  EnableConnections: !Not [!Equals [!Join ['', !Ref ConnectedRoleArns], '']]
+Globals:
+  Function:
+    Runtime: python3.12
+    CodeUri: ./
+    Timeout: 29
+    MemorySize: 512
+    Environment:
+      Variables:
+        SCAN_TABLE: !Ref Scans
+        SCAN_ALL_REGIONS: 'true'
+        SCAN_MULTI_ACCOUNT: 'false'
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        ALLOWED_ROLE_ARNS: !Join [',', !Ref ConnectedRoleArns]
+Resources:
+  Scans:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: pk, AttributeType: S}, {AttributeName: kind, AttributeType: S}, {AttributeName: sort, AttributeType: S}]
+      KeySchema: [{AttributeName: pk, KeyType: HASH}]
+      GlobalSecondaryIndexes:
+        - IndexName: kind-index
+          KeySchema: [{AttributeName: kind, KeyType: HASH}, {AttributeName: sort, KeyType: RANGE}]
+          Projection: {ProjectionType: ALL}
+      SSESpecification: {SSEEnabled: true}
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+  Token:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString: {PasswordLength: 48, ExcludePunctuation: true}
+  Users:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      AdminCreateUserConfig: {AllowAdminCreateUserOnly: true}
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: 'ON'
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy: {MinimumLength: 14, RequireLowercase: true, RequireUppercase: true, RequireNumbers: true, RequireSymbols: true}
+  Client:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref Users
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Ref CallbackURL]
+      LogoutURLs: [!Ref CallbackURL]
+      PreventUserExistenceErrors: ENABLED
+  Domain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties: {Domain: !Ref CognitoDomainPrefix, UserPoolId: !Ref Users}
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings: {ThrottlingBurstLimit: 10, ThrottlingRateLimit: 5}
+      CorsConfiguration:
+        AllowOrigins: [!Ref AllowedOrigin]
+        AllowHeaders: [Authorization, Content-Type, MCP-Protocol-Version, Mcp-Session-Id]
+        AllowMethods: [GET, POST, OPTIONS, DELETE]
+      Auth:
+        Authorizers:
+          Cognito:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${Users}'
+              audience: [!Ref Client]
+  AuditPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Read-only account inspection. Separate role grants storage writes to assistant-owned data only.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Resource: '*'
+            Action:
+              - sts:GetCallerIdentity
+              - ce:GetCostAndUsage
+              - ce:GetCostForecast
+              - ce:GetAnomalies
+              - freetier:GetFreeTierUsage
+              - s3:ListAllMyBuckets
+              - s3:GetAccountPublicAccessBlock
+              - s3:GetBucketPublicAccessBlock
+              - s3:GetBucketPolicyStatus
+              - s3:GetBucketAcl
+              - iam:ListUsers
+              - iam:GetLoginProfile
+              - iam:ListMFADevices
+              - iam:ListAccessKeys
+              - iam:GetAccountSummary
+              - ec2:DescribeRegions
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeVolumes
+              - ec2:DescribeAddresses
+              - ec2:DescribeSnapshots
+              - ec2:DescribeInstances
+              - rds:DescribeDBInstances
+              - cloudwatch:DescribeAlarms
+              - cloudwatch:GetMetricStatistics
+          - Effect: Allow
+            Action: logs:FilterLogEvents
+            Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/*:*'
+  Scanner:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.storage.scan_handler
+      Timeout: 900
+      ReservedConcurrentExecutions: 1
+      Policies:
+        - !Ref AuditPolicy
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:ConditionCheckItem]
+              Resource: [!GetAtt Scans.Arn, !Sub '${Scans.Arn}/index/kind-index']
+        - Statement:
+            - {Effect: Allow, Action: 'sns:Publish', Resource: !Ref Notifications}
+            - {Effect: Allow, Action: 'sqs:SendMessage', Resource: !GetAtt ScannerDLQ.Arn}
+        - !Ref InferencePolicy
+        - !If [EnableConnections, !Ref AssumeConnectionsPolicy, !Ref 'AWS::NoValue']
+      DeadLetterQueue: {Type: SQS, TargetArn: !GetAtt ScannerDLQ.Arn}
+      EventInvokeConfig:
+        MaximumEventAgeInSeconds: 900
+        MaximumRetryAttempts: 0
+      Environment:
+        Variables:
+          REPORT_TOPIC: !Ref Notifications
+      Events:
+        Nightly: {Type: Schedule, Properties: {Schedule: 'cron(0 20 * * ? *)', Description: '01:30 India time daily'}}
+  Backend:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.app.mcp_handler
+      ReservedConcurrentExecutions: 3
+      Environment:
+        Variables:
+          TOKEN_SECRET: !Ref Token
+          ALLOWED_ORIGINS: !Ref AllowedOrigin
+          OAUTH_LOGIN_CLIENT: !Ref OAuthLoginClient
+          COGNITO_DOMAIN: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+          COGNITO_ISSUER: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${Users}' 
+      Policies:
+        - !Ref AuditPolicy
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt Scans.Arn
+            - Effect: Allow
+              Action: dynamodb:DeleteItem
+              Resource: !GetAtt Scans.Arn
+              Condition: {ForAllValues:StringLike: {dynamodb:LeadingKeys: ['oauth#*']}}
+        - !Ref InferencePolicy
+        - !If [EnableConnections, !Ref AssumeConnectionsPolicy, !Ref 'AWS::NoValue']
+        - Statement:
+            - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !Ref Token}
+      Events:
+        Health: {Type: HttpApi, Properties: {ApiId: !Ref Api, Path: /health, Method: GET}}
+        MCP: {Type: HttpApi, Properties: {ApiId: !Ref Api, Path: /mcp, Method: ANY}}
+        Metadata: {Type: HttpApi, Properties: {ApiId: !Ref Api, Path: '/.well-known/{proxy+}', Method: GET}}
+        OAuth: {Type: HttpApi, Properties: {ApiId: !Ref Api, Path: '/oauth/{proxy+}', Method: ANY}}
+  BackendLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${Backend}', RetentionInDays: 7}
+  ScannerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${Scanner}', RetentionInDays: 7}
+  Errors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions: [!Ref Notifications]
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref Scanner}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+  OriginAccess:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig: {Name: !Sub '${AWS::StackName}-dashboard', OriginAccessControlOriginType: s3, SigningBehavior: always, SigningProtocol: sigv4}
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: dashboard
+            DomainName: !GetAtt DashboardBucket.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccess
+            S3OriginConfig: {OriginAccessIdentity: ''}
+        DefaultCacheBehavior:
+          TargetOriginId: dashboard
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+          - {ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 0}
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${DashboardBucket.Arn}/*'
+            Condition: {StringEquals: {'AWS:SourceArn': !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'}}
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt DashboardBucket.Arn, !Sub '${DashboardBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': false}}
+  Budget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub '${AWS::StackName}-account-budget'
+        BudgetLimit: {Amount: !Ref MonthlyBudget, Unit: USD}
+        TimeUnit: MONTHLY
+        BudgetType: COST
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 50, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref BudgetEmail}]
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref BudgetEmail}]
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref BudgetEmail}]
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {GroupName: admin, UserPoolId: !Ref Users, Description: May trigger scans and register customer accounts}
+  ViewerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: {GroupName: viewer, UserPoolId: !Ref Users, Description: May read reports and audit tools}
+  OAuthLoginClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref Users
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Ref OAuthCallbackURL]
+      PreventUserExistenceErrors: ENABLED
+  Notifications:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription: [{Protocol: email, Endpoint: !Ref NotificationEmail}]
+  ScannerDLQ:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions: [!Ref Notifications]
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt ScannerDLQ.QueueName}]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  InferencePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: bedrock:InvokeModel
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'
+  AssumeConnectionsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: EnableConnections
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Action: 'sts:AssumeRole', Resource: !Ref ConnectedRoleArns}
+  AuditWorker:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.worker.handler
+      ReservedConcurrentExecutions: 2
+      Policies:
+        - !Ref AuditPolicy
+        - !Ref InferencePolicy
+        - !If [EnableConnections, !Ref AssumeConnectionsPolicy, !Ref 'AWS::NoValue']
+        - Statement:
+            - {Effect: Allow, Action: [dynamodb:GetItem, dynamodb:PutItem], Resource: !GetAtt Scans.Arn}
+  Dashboard:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.app.dashboard_handler
+      ReservedConcurrentExecutions: 3
+      Environment:
+        Variables:
+          ALLOWED_ORIGINS: !Ref AllowedOrigin
+          SCAN_FUNCTION: !Ref Scanner
+          AUDIT_WORKER: !Ref AuditWorker
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query]
+              Resource: [!GetAtt Scans.Arn, !Sub '${Scans.Arn}/index/kind-index']
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource: !GetAtt Scans.Arn
+              Condition: {ForAllValues:StringLike: {dynamodb:LeadingKeys: ['scan#*', 'connection#*']}}
+            - {Effect: Allow, Action: 'lambda:InvokeFunction', Resource: [!GetAtt Scanner.Arn, !GetAtt AuditWorker.Arn]}
+      Events:
+        Report: {Type: HttpApi, Properties: {ApiId: !Ref Api, Path: /api/report, Method: GET, Auth: {Authorizer: Cognito}}}
+        History: {Type: HttpApi, Properties: {ApiId: !Ref Api, Path: /api/history, Method: GET, Auth: {Authorizer: Cognito}}}
+        Scan: {Type: HttpApi, Properties: {ApiId: !Ref Api, Path: /api/scan, Method: POST, Auth: {Authorizer: Cognito}}}
+        ScanStatus: {Type: HttpApi, Properties: {ApiId: !Ref Api, Path: '/api/scan/{job_id}', Method: GET, Auth: {Authorizer: Cognito}}}
+        Tools: {Type: HttpApi, Properties: {ApiId: !Ref Api, Path: '/api/tools/{name}', Method: POST, Auth: {Authorizer: Cognito}}}
+        ConnectionsRead: {Type: HttpApi, Properties: {ApiId: !Ref Api, Path: /api/connections, Method: GET, Auth: {Authorizer: Cognito}}}
+        ConnectionsWrite: {Type: HttpApi, Properties: {ApiId: !Ref Api, Path: /api/connections, Method: POST, Auth: {Authorizer: Cognito}}}
+  DashboardLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${Dashboard}', RetentionInDays: 7}
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${AuditWorker}', RetentionInDays: 7}
+  AnomalyMonitor:
+    Type: AWS::CE::AnomalyMonitor
+    Condition: CreateAnomalyMonitor
+    Properties: {MonitorName: !Sub '${AWS::StackName}-services', MonitorType: DIMENSIONAL, MonitorDimension: SERVICE}
+Outputs:
+  ApiUrl: {Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com'}
+  MCPUrl: {Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/mcp'}
+  TokenSecretArn: {Value: !Ref Token}
+  UserPoolId: {Value: !Ref Users}
+  ClientId: {Value: !Ref Client}
+  LoginDomain: {Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'}
+  DashboardBucket: {Value: !Ref DashboardBucket}
+  DistributionId: {Value: !Ref Distribution}
+  DashboardUrl: {Value: !Sub 'https://${Distribution.DomainName}'}
+  ScannerFunction: {Value: !Ref Scanner}
+
+  MCPRoleArn: {Value: !GetAtt BackendRole.Arn}
+  ScannerRoleArn: {Value: !GetAtt ScannerRole.Arn}
+  WorkerRoleArn: {Value: !GetAtt AuditWorkerRole.Arn}

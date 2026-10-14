@@ -1,0 +1,20 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Install in a customer sandbox to grant AWS Assistant read-only account inspection.
+Parameters:
+  AssistantRoleArns: {Type: CommaDelimitedList, Description: 'Exact MCP, scanner and worker role ARNs from the hosting account'}
+  ExternalId: {Type: String, MinLength: 32, NoEcho: true}
+Resources:
+  AuditRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {AWS: !Ref AssistantRoleArns}
+            Action: sts:AssumeRole
+            Condition: {StringEquals: {'sts:ExternalId': !Ref ExternalId}}
+      ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess']
+Outputs:
+  AuditRoleArn: {Value: !GetAtt AuditRole.Arn}

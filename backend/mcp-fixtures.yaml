@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Sandbox-only MCP fixtures. No public S3 policy. Optional private EC2
+  instance incurs charges.
+Parameters:
+  SandboxAcknowledgement:
+    Type: String
+    AllowedValues:
+    - I_ACCEPT_SANDBOX_FIXTURE_CHARGES
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+  LaunchEC2:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+    - 'true'
+    - 'false'
+  LinuxAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+Resources:
+  FixtureVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.123.0.0/24
+      Tags:
+      - Key: Purpose
+        Value: aws-assistant-validation
+      - Key: Consent
+        Value:
+          Ref: SandboxAcknowledgement
+  OpenSSH:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Audit fixture with no attached instances
+      VpcId:
+        Ref: FixtureVPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+  UnattachedVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      AvailabilityZone:
+        Ref: AvailabilityZone
+      Size: 1
+      VolumeType: gp3
+      Encrypted: true
+  UnusedIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  FixtureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWSAssistant/Sandbox
+      MetricName: Errors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+  ConsolePassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        PasswordLength: 32
+  ConsoleUserWithoutMFA:
+    Type: AWS::IAM::User
+    Properties:
+      LoginProfile:
+        Password:
+          Fn::Sub: '{{resolve:secretsmanager:${ConsolePassword}:SecretString}}'
+        PasswordResetRequired: true
+  LogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  ErrorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role:
+        Fn::GetAtt:
+        - LogRole
+        - Arn
+      Timeout: 3
+      Code:
+        ZipFile: "def handler(event, context):\n    print('ERROR sandbox validation\
+          \ fixture')\n    raise RuntimeError('Intentional validation error')\n"
+  PrivateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: FixtureVPC
+      CidrBlock: 10.123.0.0/26
+      AvailabilityZone:
+        Ref: AvailabilityZone
+  Instance:
+    Type: AWS::EC2::Instance
+    Condition: CreateEC2
+    Properties:
+      ImageId:
+        Ref: LinuxAMI
+      InstanceType: t3.micro
+      NetworkInterfaces:
+      - DeviceIndex: '0'
+        AssociatePublicIpAddress: false
+        SubnetId:
+          Ref: Subnet
+        GroupSet:
+        - Fn::GetAtt:
+          - OpenSSH
+          - GroupId
+      Tags:
+      - Key: Purpose
+        Value: aws-assistant-validation
+Outputs:
+  OpenSecurityGroup:
+    Value:
+      Fn::GetAtt:
+      - OpenSSH
+      - GroupId
+  UnattachedVolume:
+    Value:
+      Ref: UnattachedVolume
+  UnusedIP:
+    Value:
+      Ref: UnusedIP
+  Alarm:
+    Value:
+      Ref: FixtureAlarm
+  ConsoleUser:
+    Value:
+      Ref: ConsoleUserWithoutMFA
+  FunctionName:
+    Value:
+      Ref: ErrorFunction
+  PrivateBucket:
+    Value:
+      Ref: PrivateBucket
+  InstanceId:
+    Condition: CreateEC2
+    Value:
+      Ref: Instance
+Conditions:
+  CreateEC2:
+    Fn::Equals:
+    - Ref: LaunchEC2
+    - 'true'
